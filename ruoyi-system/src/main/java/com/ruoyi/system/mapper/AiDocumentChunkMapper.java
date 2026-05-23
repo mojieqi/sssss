@@ -40,4 +40,14 @@ public interface AiDocumentChunkMapper {
      * 检索分块(关键词匹配)
      */
     List<AiDocumentChunk> searchChunks(AiDocumentChunk searchParam);
+
+    /**
+     * 获取知识库下所有分块(用于向量化和语义搜索)
+     */
+    List<AiDocumentChunk> selectChunksByKbId(Long kbId);
+
+    /**
+     * 更新分块向量
+     */
+    int updateChunkVector(Long chunkId, String chunkVector);
 }

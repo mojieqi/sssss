@@ -60,4 +60,16 @@ PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
         limit 50
     </select>
 
+    <select id="selectChunksByKbId" parameterType="Long" resultMap="AiDocumentChunkResult">
+        <include refid="selectChunkVo"/>
+        where kb_id = #{kbId}
+        order by chunk_index asc
+    </select>
+
+    <update id="updateChunkVector">
+        update ai_document_chunk
+        set chunk_vector = #{chunkVector}
+        where chunk_id = #{chunkId}
+    </update>
+
 </mapper>
