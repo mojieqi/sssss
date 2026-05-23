@@ -21,6 +21,8 @@ import java.util.function.Consumer;
 /**
  * LLM调用器 — 负责调用LLM API的流式请求
  *
+ * Phase 4 升级: 支持 tools/Function Calling 参数
+ *
  * @author ruoyi
  * @date 2026-05-23
  */
@@ -42,6 +44,22 @@ public class LlmCaller {
      */
     public void chatStream(AgentContext context, JSONArray messages, SseEmitter emitter,
                            Consumer<String> onComplete) {
+        chatStreamInternal(context, messages, null, emitter, onComplete);
+    }
+
+    /**
+     * 流式调用LLM API（带tools参数）
+     */
+    public void chatStream(AgentContext context, JSONArray messages, JSONArray tools,
+                           SseEmitter emitter, Consumer<String> onComplete) {
+        chatStreamInternal(context, messages, tools, emitter, onComplete);
+    }
+
+    /**
+     * 流式调用核心逻辑
+     */
+    private void chatStreamInternal(AgentContext context, JSONArray messages, JSONArray tools,
+                                     SseEmitter emitter, Consumer<String> onComplete) {
         try {
             String baseUrl = context.getBaseUrl();
             if (!baseUrl.endsWith("/")) {
@@ -57,7 +75,12 @@ public class LlmCaller {
             requestBody.put("max_tokens", context.getMaxTokens());
             requestBody.put("stream_options", Map.of("include_usage", true));
 
-            // 使用 HttpURLConnection 进行流式读取
+            // Phase 4: 注入tools
+            if (tools != null && !tools.isEmpty()) {
+                requestBody.put("tools", tools);
+                requestBody.put("tool_choice", "auto");
+            }
+
             URI uri = URI.create(apiUrl);
             HttpURLConnection connection = (HttpURLConnection) uri.toURL().openConnection();
             connection.setRequestMethod("POST");
@@ -66,16 +89,14 @@ public class LlmCaller {
             connection.setRequestProperty("Accept", "text/event-stream");
             connection.setDoOutput(true);
             connection.setConnectTimeout(30000);
-            connection.setReadTimeout(300000); // 5分钟读超时
+            connection.setReadTimeout(300000);
 
-            // 发送请求体
             byte[] body = JSON.toJSONString(requestBody).getBytes(StandardCharsets.UTF_8);
             try (OutputStream os = connection.getOutputStream()) {
                 os.write(body);
                 os.flush();
             }
 
-            // 读取流式响应
             int responseCode = connection.getResponseCode();
             if (responseCode != 200) {
                 String errorMsg = readErrorResponse(connection);
@@ -109,7 +130,6 @@ public class LlmCaller {
                 }
             }
 
-            // 完成
             emitter.send(SseEmitter.event().name("done").data("[DONE]"));
             emitter.complete();
 
@@ -125,6 +145,47 @@ public class LlmCaller {
                 emitter.completeWithError(ex);
             }
         }
+    }
+
+    /**
+     * 同步(非流式)调用LLM，返回完整的 JSONObject 响应
+     * 用于 Function Calling 决策轮次
+     *
+     * @param context  Agent上下文
+     * @param messages 消息数组
+     * @param tools    工具定义数组
+     * @return 完整的LLM响应JSON
+     */
+    public JSONObject chatSyncWithTools(AgentContext context, JSONArray messages, JSONArray tools) {
+        String baseUrl = context.getBaseUrl();
+        if (!baseUrl.endsWith("/")) {
+            baseUrl += "/";
+        }
+        String apiUrl = baseUrl + "chat/completions";
+
+        Map<String, Object> requestBody = new HashMap<>();
+        requestBody.put("model", context.getModelName() != null ? context.getModelName() : "gpt-3.5-turbo");
+        requestBody.put("messages", messages);
+        requestBody.put("temperature", context.getTemperature());
+        requestBody.put("max_tokens", context.getMaxTokens());
+
+        if (tools != null && !tools.isEmpty()) {
+            requestBody.put("tools", tools);
+            requestBody.put("tool_choice", "auto");
+        }
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("Authorization", "Bearer " + context.getApiKey());
+        headers.set("Content-Type", "application/json");
+
+        HttpEntity<String> entity = new HttpEntity<>(JSON.toJSONString(requestBody), headers);
+        ResponseEntity<String> response = restTemplate.postForEntity(apiUrl, entity, String.class);
+
+        String body = response.getBody();
+        if (body != null) {
+            return JSON.parseObject(body);
+        }
+        return null;
     }
 
     /**
@@ -172,6 +233,40 @@ public class LlmCaller {
         } catch (Exception e) {
             return null;
         }
+    }
+
+    // --- 公共静态工具方法 ---
+
+    /**
+     * 从LLM响应中提取文本内容
+     */
+    public static String extractContent(JSONObject llmResponse) {
+        if (llmResponse == null) return null;
+        JSONArray choices = llmResponse.getJSONArray("choices");
+        if (choices != null && !choices.isEmpty()) {
+            JSONObject choice = choices.getJSONObject(0);
+            JSONObject message = choice.getJSONObject("message");
+            if (message != null) {
+                return message.getString("content");
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 从LLM响应中提取tool_calls
+     */
+    public static JSONArray extractToolCalls(JSONObject llmResponse) {
+        if (llmResponse == null) return null;
+        JSONArray choices = llmResponse.getJSONArray("choices");
+        if (choices != null && !choices.isEmpty()) {
+            JSONObject choice = choices.getJSONObject(0);
+            JSONObject message = choice.getJSONObject("message");
+            if (message != null) {
+                return message.getJSONArray("tool_calls");
+            }
+        }
+        return null;
     }
 
     // --- private helpers ---

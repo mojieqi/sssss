@@ -2,23 +2,39 @@
   <div class="chat-window">
     <!-- 消息列表 -->
     <div class="message-list" ref="messageList" @scroll="handleScroll">
-      <div v-if="messages.length === 0 && !streaming" class="empty-hint">
+      <div v-if="messages.length === 0 && !streaming && toolCalls.length === 0" class="empty-hint">
         <i class="el-icon-chat-dot-round"></i>
         <p>开始与 AI Agent 对话</p>
         <p class="sub-hint">选择左侧会话或新建对话</p>
       </div>
 
-      <MessageBubble
-        v-for="msg in displayMessages"
-        :key="msg.messageId || msg._tempId"
-        :role="msg.role"
-        :content="msg.content"
-        :createTime="msg.createTime"
-        :toolCalls="msg.toolCalls"
+      <template v-for="msg in displayMessages">
+        <!-- 工具调用消息 -->
+        <ToolResultCard
+          v-if="msg.role === 'tool_call' || msg.role === 'tool'"
+          :key="'tool-' + (msg._tempId || msg.messageId || msg.id)"
+          :card-data="msg"
+        />
+        <!-- 普通消息 -->
+        <MessageBubble
+          v-else
+          :key="msg.messageId || msg._tempId"
+          :role="msg.role"
+          :content="msg.content"
+          :createTime="msg.createTime"
+          :toolCalls="msg.toolCalls"
+        />
+      </template>
+
+      <!-- 流式生成中的工具调用卡片 -->
+      <ToolResultCard
+        v-for="tc in toolCalls"
+        :key="'stream-tool-' + tc.id"
+        :card-data="tc"
       />
 
       <!-- 流式生成中的临时气泡 -->
-      <div v-if="streaming" class="message-bubble assistant">
+      <div v-if="streaming && streamContent" class="message-bubble assistant">
         <div class="message-avatar"><i class="el-icon-cpu"></i></div>
         <div class="message-body">
           <div class="message-role">AI助手</div>
@@ -62,19 +78,20 @@
 
 <script>
 import MessageBubble from './MessageBubble.vue'
+import ToolResultCard from './ToolResultCard.vue'
 
 export default {
   name: 'ChatWindow',
-  components: { MessageBubble },
+  components: { MessageBubble, ToolResultCard },
   props: {
     messages: { type: Array, default: () => [] },
     streaming: { type: Boolean, default: false },
-    streamContent: { type: String, default: '' }
+    streamContent: { type: String, default: '' },
+    /** 流式中的工具调用列表 [{ id, name, arguments, success, content, pending }] */
+    toolCalls: { type: Array, default: () => [] }
   },
   data() {
-    return {
-      inputText: ''
-    }
+    return { inputText: '' }
   },
   computed: {
     displayMessages() {
@@ -91,6 +108,10 @@ export default {
     },
     streamContent() {
       this.$nextTick(() => this.scrollToBottom())
+    },
+    toolCalls: {
+      handler() { this.$nextTick(() => this.scrollToBottom()) },
+      deep: true
     }
   },
   methods: {
@@ -103,9 +124,7 @@ export default {
     },
     scrollToBottom() {
       const el = this.$refs.messageList
-      if (el) {
-        el.scrollTop = el.scrollHeight
-      }
+      if (el) { el.scrollTop = el.scrollHeight }
     },
     handleScroll() {},
     simpleMarkdown(text) {

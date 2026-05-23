@@ -1,11 +1,14 @@
 package com.ruoyi.system.service.impl;
 
 import com.ruoyi.system.agent.*;
+import com.ruoyi.system.agent.tool.ToolRegistry;
 import com.ruoyi.system.domain.*;
 import com.ruoyi.system.mapper.*;
 import com.ruoyi.system.service.IAiAgentService;
 import com.ruoyi.system.service.IEmbeddingService;
 import com.ruoyi.common.utils.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
@@ -19,11 +22,15 @@ import java.util.stream.Collectors;
  *
  * 编排Agent引擎、会话管理、知识库检索、消息持久化
  *
+ * Phase 4 升级: 注入ToolRegistry，支持 Function Calling 工具调用
+ *
  * @author ruoyi
  * @date 2026-05-23
  */
 @Service
 public class AiAgentServiceImpl implements IAiAgentService {
+
+    private static final Logger log = LoggerFactory.getLogger(AiAgentServiceImpl.class);
 
     @Autowired
     private AiConversationMapper conversationMapper;
@@ -46,53 +53,45 @@ public class AiAgentServiceImpl implements IAiAgentService {
     @Autowired
     private RestTemplate restTemplate;
 
+    @Autowired(required = false)
+    private ToolRegistry toolRegistry;
+
     /** SseEmitter 超时时间(毫秒) */
-    private static final long SSE_TIMEOUT = 300000L; // 5分钟
+    private static final long SSE_TIMEOUT = 300000L;
 
     /** RAG上下文最大字符数 */
     private static final int RAG_MAX_CHARS = 2000;
 
     @Override
     public SseEmitter chat(Long conversationId, String userMessage) {
-        // 1. 超时SSE
         SseEmitter emitter = new SseEmitter(SSE_TIMEOUT);
 
-        // 2. 加载会话
+        // 1. 加载会话
         AiConversation conversation = conversationMapper.selectAiConversationById(conversationId);
         if (conversation == null) {
-            try {
-                emitter.send(SseEmitter.event().name("error").data("会话不存在"));
-                emitter.complete();
-            } catch (Exception e) {
-                emitter.completeWithError(e);
-            }
+            sendEmitterError(emitter, "会话不存在");
             return emitter;
         }
 
-        // 3. 加载LLM配置
+        // 2. 加载LLM配置
         AiLlmConfig llmConfig = llmConfigMapper.selectAiLlmConfigById(conversation.getLlmConfigId());
         if (llmConfig == null || StringUtils.isEmpty(llmConfig.getApiKey())) {
-            try {
-                emitter.send(SseEmitter.event().name("error").data("LLM配置无效，API Key未设置"));
-                emitter.complete();
-            } catch (Exception e) {
-                emitter.completeWithError(e);
-            }
+            sendEmitterError(emitter, "LLM配置无效，API Key未设置");
             return emitter;
         }
 
-        // 4. 加载系统提示词
+        // 3. 加载系统提示词
         String systemPrompt = loadSystemPrompt(conversation);
 
-        // 5. 加载历史消息
+        // 4. 加载历史消息
         List<AiConversationMessage> history = messageMapper.selectAiConversationMessageList(
                 new AiConversationMessage() {{ setConversationId(conversationId); }}
         );
 
-        // 6. 知识库检索 (RAG)
+        // 5. 知识库检索 (RAG)
         String knowledgeContext = searchKnowledgeBase(conversation, userMessage);
 
-        // 7. 构建Agent上下文
+        // 6. 构建Agent上下文
         AgentContext context = AgentContext.builder()
                 .conversationId(conversationId)
                 .systemPrompt(systemPrompt)
@@ -107,7 +106,7 @@ public class AiAgentServiceImpl implements IAiAgentService {
                 .temperature(0.7)
                 .build();
 
-        // 8. 创建Agent引擎并执行
+        // 7. 创建Agent引擎并执行
         AgentEngine engine = createEngine();
         engine.execute(context, emitter, new AgentEngine.AgentCallback() {
             @Override
@@ -116,11 +115,27 @@ public class AiAgentServiceImpl implements IAiAgentService {
             }
 
             @Override
+            public void onToolCallMessage(AiConversationMessage assistantToolCallMsg) {
+                // 保存 assistant 的 tool_calls 消息
+                messageMapper.insertAiConversationMessage(assistantToolCallMsg);
+            }
+
+            @Override
+            public void onToolMessage(AiConversationMessage toolResultMsg, String toolName) {
+                // 保存 tool 角色消息
+                messageMapper.insertAiConversationMessage(toolResultMsg);
+                log.debug("保存工具结果消息: {} -> {}", toolName,
+                        toolResultMsg.getContent() != null
+                                ? toolResultMsg.getContent().substring(0, Math.min(50, toolResultMsg.getContent().length()))
+                                : "");
+            }
+
+            @Override
             public void onAssistantMessage(AiConversationMessage assistantMsg, String summary) {
                 messageMapper.insertAiConversationMessage(assistantMsg);
                 conversationMapper.updateMessageCount(conversationId);
 
-                // 更新会话标题(首次对话时用用户消息的前30字)
+                // 更新会话标题(首次对话时)
                 if (history.isEmpty() && conversation.getTitle().equals("新对话")) {
                     AiConversation update = new AiConversation();
                     update.setConversationId(conversationId);
@@ -131,7 +146,7 @@ public class AiAgentServiceImpl implements IAiAgentService {
             }
         });
 
-        // 9. 处理SSE异常和超时
+        // SSE 生命周期
         emitter.onTimeout(() -> {});
         emitter.onError(ex -> {});
         emitter.onCompletion(() -> {});
@@ -157,8 +172,18 @@ public class AiAgentServiceImpl implements IAiAgentService {
         return new AgentEngine(
                 new MemoryManager(),
                 new PromptBuilder(),
-                new LlmCaller(restTemplate)
+                new LlmCaller(restTemplate),
+                toolRegistry
         );
+    }
+
+    private void sendEmitterError(SseEmitter emitter, String msg) {
+        try {
+            emitter.send(SseEmitter.event().name("error").data(msg));
+            emitter.complete();
+        } catch (Exception e) {
+            emitter.completeWithError(e);
+        }
     }
 
     private String loadSystemPrompt(AiConversation conversation) {

@@ -45,6 +45,15 @@ public interface IEmbeddingService {
     List<ChunkSearchResult> searchInBase(Long kbId, String query, int topK);
 
     /**
+     * 全局知识库搜索（搜索所有知识库）
+     *
+     * @param query    查询文本
+     * @param topK     返回Top-K结果
+     * @return 相关度排序的分块列表
+     */
+    List<ChunkSearchResult> searchGlobal(String query, int topK);
+
+    /**
      * 计算结果集合并为RAG上下文文本
      */
     String buildKnowledgeContext(List<ChunkSearchResult> results, int maxChars);

@@ -162,6 +162,22 @@ public class EmbeddingServiceImpl implements IEmbeddingService {
     }
 
     @Override
+    public List<ChunkSearchResult> searchGlobal(String query, int topK) {
+        // 获取所有知识库的分块，用关键词降级搜索
+        AiDocumentChunk searchParam = new AiDocumentChunk();
+        searchParam.setChunkContent(query);
+        List<AiDocumentChunk> chunks = chunkMapper.searchChunks(searchParam);
+
+        return chunks.stream()
+                .map(chunk -> new ChunkSearchResult(
+                        chunk.getChunkId(), chunk.getDocId(), chunk.getKbId(),
+                        chunk.getChunkContent(), 0.5
+                ))
+                .limit(Math.min(topK, 10))
+                .collect(Collectors.toList());
+    }
+
+    @Override
     public String buildKnowledgeContext(List<ChunkSearchResult> results, int maxChars) {
         if (results == null || results.isEmpty()) {
             return null;

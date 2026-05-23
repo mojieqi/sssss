@@ -16,6 +16,7 @@
       :messages="messages"
       :streaming="streaming"
       :streamContent="streamContent"
+      :toolCalls="toolCalls"
       @send="handleSendMessage"
       @stop="handleStop"
     />
@@ -64,6 +65,9 @@ export default {
       currentReader: null,
       abortController: null,
 
+      // 工具调用状态（Phase 4）：流式过程中实时展示的工具调用卡片
+      toolCalls: [],
+
       // 选项数据
       llmConfigs: [],
       systemPrompts: [],
@@ -106,7 +110,6 @@ export default {
 
     // ==================== 会话操作 ====================
     async handleNewConversation() {
-      // 默认使用第一个LLM配置
       const defaultConfig = this.llmConfigs.length > 0 ? this.llmConfigs[0].configId : null
       if (!defaultConfig) {
         this.$message.warning('没有可用的LLM配置，请先在【LLM大模型配置】中添加')
@@ -122,7 +125,6 @@ export default {
         })
         this.$message.success('新建会话成功')
         await this.loadConversations()
-        // 选中新会话
         const newConv = this.conversationList.find(c => c.conversationId === res.data?.conversationId)
         if (newConv) {
           this.handleSelectConversation(newConv)
@@ -176,11 +178,10 @@ export default {
 
     async handleUpdateSettings(settings) {
       if (!this.activeConversationId) return
-      // 仅在前端更新 activeConversation，下次对话时后端会读取最新设置
       Object.assign(this.activeConversation, settings)
     },
 
-    // ==================== 消息发送 ====================
+    // ==================== 消息发送 (Phase 4 升级) ====================
     async handleSendMessage(text) {
       if (!this.activeConversationId) {
         this.$message.warning('请先选择或创建一个会话')
@@ -199,6 +200,7 @@ export default {
       // 开始流式
       this.streaming = true
       this.streamContent = ''
+      this.toolCalls = []
 
       try {
         const response = await chatStream(this.activeConversationId, text)
@@ -212,6 +214,7 @@ export default {
         const decoder = new TextDecoder()
         let buffer = ''
         let streamDone = false
+        let currentEventType = 'message'
 
         while (!streamDone) {
           const { done, value } = await reader.read()
@@ -222,15 +225,36 @@ export default {
           buffer = lines.pop() || ''
 
           for (const line of lines) {
+            // 解析SSE event类型
+            if (line.startsWith('event:')) {
+              currentEventType = line.substring(6).trim()
+              continue
+            }
+
             if (line.startsWith('data:')) {
               const data = line.substring(5).trim()
+
               if (data === '[DONE]') {
                 streamDone = true
                 break
               }
-              if (data) {
+
+              if (!data) continue
+
+              // Phase 4: 处理工具调用事件
+              if (currentEventType === 'tool_call') {
+                this.handleToolCallEvent(data)
+              } else if (currentEventType === 'tool_result') {
+                this.handleToolResultEvent(data)
+              } else {
+                // 默认: message 事件 — 流式文本
                 this.streamContent += data
               }
+            }
+
+            // 重置事件类型（data行处理完后）
+            if (line.startsWith('data:')) {
+              currentEventType = 'message'
             }
           }
         }
@@ -251,6 +275,7 @@ export default {
       } finally {
         this.streaming = false
         this.streamContent = ''
+        this.toolCalls = []
         this.currentReader = null
         // 刷新消息列表和会话列表
         if (this.activeConversationId) {
@@ -262,12 +287,49 @@ export default {
       }
     },
 
+    /** Phase 4: 处理 tool_call SSE 事件 */
+    handleToolCallEvent(data) {
+      try {
+        const tc = JSON.parse(data)
+        const existing = this.toolCalls.find(t => t.id === tc.id)
+        if (existing) return
+
+        this.toolCalls.push({
+          id: tc.id,
+          name: tc.name,
+          arguments: tc.arguments,
+          success: true,
+          pending: true,
+          role: 'tool_call',
+          _tempId: 'tc-' + tc.id
+        })
+      } catch (e) {
+        console.error('解析tool_call事件失败', e)
+      }
+    },
+
+    /** Phase 4: 处理 tool_result SSE 事件 */
+    handleToolResultEvent(data) {
+      try {
+        const tr = JSON.parse(data)
+        const existing = this.toolCalls.find(t => t.id === tr.id)
+        if (existing) {
+          existing.pending = false
+          existing.success = tr.success !== false
+          existing.content = tr.content || '工具执行完成'
+        }
+      } catch (e) {
+        console.error('解析tool_result事件失败', e)
+      }
+    },
+
     handleStop() {
       if (this.currentReader) {
         this.currentReader.cancel()
         this.currentReader = null
       }
       this.streaming = false
+      this.toolCalls = []
       if (this.streamContent) {
         this.messages.push({
           _tempId: Date.now(),

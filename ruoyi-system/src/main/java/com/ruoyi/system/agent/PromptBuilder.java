@@ -9,6 +9,8 @@ import java.util.List;
 /**
  * 提示词构建器 — 组装发送给LLM的完整消息数组
  *
+ * Phase 4 升级: 暴露独立的消息构建方法，支持 Function Calling 循环中的动态消息拼接
+ *
  * @author ruoyi
  * @date 2026-05-23
  */
@@ -16,37 +18,31 @@ public class PromptBuilder {
 
     /**
      * 构建完整的消息数组 (OpenAI兼容格式)
-     *
-     * @param context Agent上下文
-     * @param summary 早期对话的摘要(可为null)
-     * @return JSONArray 消息数组
      */
     public JSONArray buildMessages(AgentContext context, String summary) {
         JSONArray messages = new JSONArray();
 
-        // 1. 系统提示词
-        buildSystemMessage(messages, context, summary);
+        messages.add(buildSystemMessageObj(context, summary));
 
-        // 2. 知识库上下文(作为系统消息的补充)
         if (context.getKnowledgeContext() != null && !context.getKnowledgeContext().isEmpty()) {
-            buildKnowledgeContext(messages, context.getKnowledgeContext());
+            messages.add(buildKnowledgeContextObj(context.getKnowledgeContext()));
         }
 
-        // 3. 摘要(如果存在)
         if (summary != null && !summary.isEmpty()) {
-            buildSummaryMessage(messages, summary);
-        }
-
-        // 4. 历史消息
-        List<AiConversationMessage> history = context.getHistory();
-        if (history != null) {
-            for (AiConversationMessage msg : history) {
-                buildHistoryMessage(messages, msg);
+            JSONObject summaryMsg = buildSummaryMessageObj(summary);
+            if (summaryMsg != null) {
+                messages.add(summaryMsg);
             }
         }
 
-        // 5. 用户当前输入
-        buildUserMessage(messages, context.getUserMessage());
+        List<AiConversationMessage> history = context.getHistory();
+        if (history != null) {
+            for (AiConversationMessage msg : history) {
+                messages.add(buildHistoryMessageObj(msg));
+            }
+        }
+
+        messages.add(buildUserMessageObj(context.getUserMessage()));
 
         return messages;
     }
@@ -70,46 +66,65 @@ public class PromptBuilder {
         return messages;
     }
 
-    // --- private helpers ---
+    // ==================== Phase 4: 独立消息构建方法 ====================
 
-    private void buildSystemMessage(JSONArray messages, AgentContext context, String summary) {
+    /**
+     * 构建系统消息JSONObject
+     */
+    public JSONObject buildSystemMessageObj(AgentContext context, String summary) {
         JSONObject msg = new JSONObject();
         msg.put("role", "system");
 
         StringBuilder content = new StringBuilder();
-
-        // 主系统提示词
         if (context.getSystemPrompt() != null && !context.getSystemPrompt().isEmpty()) {
             content.append(context.getSystemPrompt());
         } else {
             content.append("你是一个AI校园墙智能助手，可以回答校园相关的问题，帮助用户解决校园生活中的各种需求。");
         }
 
-        // 附加早期对话摘要
+        // 工具使用说明
+        if (content.indexOf("工具") == -1) {
+            content.append("\n\n你可以使用提供的工具来获取实时信息、查询知识库、审核内容等。");
+            content.append("当用户的问题需要实时信息时，请使用 web_search 工具搜索互联网。");
+            content.append("当用户询问校园相关规则制度时，请使用 kb_query 工具查询知识库。");
+        }
+
         if (summary != null && !summary.isEmpty()) {
             content.append("\n\n【历史对话摘要】\n").append(summary);
         }
 
         msg.put("content", content.toString());
-        messages.add(msg);
+        return msg;
     }
 
-    private void buildKnowledgeContext(JSONArray messages, String kbContext) {
+    /**
+     * 构建知识库上下文消息JSONObject
+     */
+    public JSONObject buildKnowledgeContextObj(String kbContext) {
         JSONObject msg = new JSONObject();
         msg.put("role", "system");
         msg.put("content", "【参考知识库内容】\n\n" + kbContext + "\n\n请基于以上参考内容回答用户问题。如果参考内容不足以回答问题，可以结合你的知识进行补充，但要明确说明。");
-        messages.add(msg);
+        return msg;
     }
 
-    private void buildSummaryMessage(JSONArray messages, String summary) {
-        // 摘要已包含在系统提示词中，此方法预留
+    /**
+     * 构建摘要消息JSONObject
+     */
+    public JSONObject buildSummaryMessageObj(String summary) {
+        if (summary == null || summary.isEmpty()) return null;
+        JSONObject msg = new JSONObject();
+        msg.put("role", "system");
+        msg.put("content", "【历史对话摘要】\n" + summary);
+        return msg;
     }
 
-    private void buildHistoryMessage(JSONArray messages, AiConversationMessage msg) {
+    /**
+     * 构建历史消息JSONObject
+     */
+    public JSONObject buildHistoryMessageObj(AiConversationMessage msg) {
         JSONObject jsonMsg = new JSONObject();
         jsonMsg.put("role", msg.getRole());
 
-        // 处理工具调用消息
         if ("tool".equals(msg.getRole()) && msg.getToolCalls() != null) {
             try {
                 jsonMsg.put("content", msg.getContent());
@@ -123,17 +138,29 @@ public class PromptBuilder {
             } catch (Exception e) {
                 jsonMsg.put("content", msg.getContent());
             }
+        } else if ("assistant".equals(msg.getRole()) && msg.getToolCalls() != null) {
+            // assistant 消息可能包含 tool_calls
+            jsonMsg.put("content", msg.getContent() != null ? msg.getContent() : null);
+            try {
+                JSONArray toolCalls = JSONArray.parse(msg.getToolCalls());
+                jsonMsg.put("tool_calls", toolCalls);
+            } catch (Exception e) {
+                jsonMsg.put("content", msg.getContent());
+            }
         } else {
             jsonMsg.put("content", msg.getContent());
         }
 
-        messages.add(jsonMsg);
+        return jsonMsg;
     }
 
-    private void buildUserMessage(JSONArray messages, String userMessage) {
+    /**
+     * 构建用户消息JSONObject
+     */
+    public JSONObject buildUserMessageObj(String userMessage) {
         JSONObject msg = new JSONObject();
         msg.put("role", "user");
         msg.put("content", userMessage);
-        messages.add(msg);
+        return msg;
     }
 }
