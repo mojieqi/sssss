@@ -14,7 +14,7 @@ ruoyi:
   captchaType: math
   # Tavily搜索API配置
   tavily:
-    api-key: ${TAVILY_API_KEY:}
+    api-key: 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
 
 # 开发环境配置
 server:
